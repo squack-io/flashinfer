@@ -354,12 +354,14 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
   static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
                 "repack_fp8_kv_to_bf16 only supports DTypeKV == __nv_fp8_e4m3");
 
-  // Only consumer warpgroup does the dequant; producer wg early-returns.
-  // The helper has no internal barriers, so this is safe — the surrounding
-  // __syncthreads() at the call sites covers cross-wg synchronization.
-  if (threadIdx.x < KTraits::NUM_COPY_THREADS) return;
-  const uint32_t thread_id = threadIdx.x - KTraits::NUM_COPY_THREADS;
-  const uint32_t num_threads = KTraits::NUM_QK_THREADS;
+  // Both warpgroups dequant: the work is a pure strided copy and the producer
+  // wg would otherwise idle at the surrounding __syncthreads() with its TMA
+  // loads already issued. Callers in BOTH branches must invoke this, since the
+  // stride below assumes all NUM_THREADS threads participate.
+  // The helper has no internal barriers — the surrounding __syncthreads() at
+  // the call sites covers cross-wg synchronization.
+  const uint32_t thread_id = threadIdx.x;
+  const uint32_t num_threads = KTraits::NUM_THREADS;
 
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
@@ -940,11 +942,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         ++smem_pipe_write_kv;
 
         if constexpr (KTraits::USE_KV_REPACK) {
+          // This wg reads the FP8 staging buffer during the dequant below, so
+          // it must observe this stage's TMA arrival first. The consumer wg
+          // already waits at the top of its loop; this is the producer's
+          // matching wait. Idempotent with the consumer_wait before the PV
+          // WGMMA below (same pipeline state, already-satisfied barrier).
+          consumer_wait(pipeline_kv, smem_pipe_read_kv);
           // d1: pair with consumer's s1 (consumer is at __syncthreads_pre_dequant
-          // right after its own consumer_wait). Producer participates as a
-          // pass-through here — only the consumer warpgroup writes the BF16
-          // staging buffer below.
+          // right after its own consumer_wait).
           __syncthreads();
+          // Both wgs dequant FP8 KV -> BF16 staging; see repack_fp8_kv_to_bf16.
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, variant.kpe_scale);
           // d2: pair with consumer's s2 (post-dequant). Once we cross this
           // barrier, the BF16 staging buffer has the current stage's data and
           // is safe to read in the PV WGMMA below.
@@ -973,11 +982,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
       if (has_kv) {
         if constexpr (KTraits::USE_KV_REPACK) {
+          // This wg reads the FP8 staging buffer during the dequant below, so
+          // it must observe this stage's TMA arrival first. The consumer wg
+          // already waits at the top of its loop; this is the producer's
+          // matching wait. Idempotent with the consumer_wait before the PV
+          // WGMMA below (same pipeline state, already-satisfied barrier).
+          consumer_wait(pipeline_kv, smem_pipe_read_kv);
           // d1: pair with consumer's s1 (consumer is at __syncthreads_pre_dequant
-          // right after its own consumer_wait). Producer participates as a
-          // pass-through here — only the consumer warpgroup writes the BF16
-          // staging buffer below.
+          // right after its own consumer_wait).
           __syncthreads();
+          // Both wgs dequant FP8 KV -> BF16 staging; see repack_fp8_kv_to_bf16.
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, variant.kpe_scale);
           // d2: pair with consumer's s2 (post-dequant). Once we cross this
           // barrier, the BF16 staging buffer has the current stage's data and
           // is safe to read in the PV WGMMA below.
@@ -1060,8 +1076,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         if constexpr (KTraits::USE_KV_REPACK) {
           // s1: pair with producer's d1 (matches per-iter __syncthreads count).
           __syncthreads();
-          // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
-          // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
+          // Both wgs dequant FP8 KV -> BF16 staging buffers; the producer wg
+          // makes the matching call in its own d1/d2 bracket.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
                                          variant.ckv_scale, variant.kpe_scale);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
@@ -1105,8 +1121,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         if constexpr (KTraits::USE_KV_REPACK) {
           // s1: pair with producer's d1 (matches per-iter __syncthreads count).
           __syncthreads();
-          // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
-          // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
+          // Both wgs dequant FP8 KV -> BF16 staging buffers; the producer wg
+          // makes the matching call in its own d1/d2 bracket.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
                                          variant.ckv_scale, variant.kpe_scale);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
@@ -1147,8 +1163,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         if constexpr (KTraits::USE_KV_REPACK) {
           // s1: pair with producer's d1 (matches per-iter __syncthreads count).
           __syncthreads();
-          // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
-          // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
+          // Both wgs dequant FP8 KV -> BF16 staging buffers; the producer wg
+          // makes the matching call in its own d1/d2 bracket.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
                                          variant.ckv_scale, variant.kpe_scale);
           // s2: ensures dequant is complete before any wg reads BF16 staging.

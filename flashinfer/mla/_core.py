@@ -1620,12 +1620,14 @@ class BatchMLAPagedAttentionWrapper:
                     "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
                     f"got SM{major}{minor}."
                 )
-            # Removing this guard exposes vec_cast<half, fp8_e4m3>, which
-            # exists but is untested for MLA — silent wrong output.
-            if q_data_type != torch.bfloat16:
+            # FP16 Q selects vec_cast<half, fp8_e4m3>, which lowers to the
+            # native `cvt.rn.f16x2.e4m3x2`; the BF16 path has no such
+            # instruction on SM90 and falls back to a software bit-twiddling
+            # dequant. Both are exercised by tests/attention/test_mla_fp8_kv.py.
+            if q_data_type not in (torch.bfloat16, torch.float16):
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
-                    f"q_data_type=torch.bfloat16, got {q_data_type}."
+                    f"q_data_type in (torch.bfloat16, torch.float16), got {q_data_type}."
                 )
             # Also enforced by static_assert in mla_hopper.cuh.
             if head_dim_ckv != 512 or head_dim_kpe != 64:
