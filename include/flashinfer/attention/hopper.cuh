@@ -219,6 +219,70 @@ struct WGMMA_ASYNC_SS<__nv_bfloat16, float, 64, 256, 16, TransposeA, TransposeB,
   }
 };
 
+
+// FP8 e4m3 WGMMA. MMA-K is 32 (vs 16 for 16-bit), and the instruction is
+// TN-only -- both operands must be K-major, which is how the MLA latent cache
+// is already laid out, so QK needs no transpose or dequant.
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 16, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                  "SM90 FP8 WGMMA is TN-only: both operands must be K-major");
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x16x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_8(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 32, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                  "SM90 FP8 WGMMA is TN-only: both operands must be K-major");
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x32x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_16(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 64, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                  "SM90 FP8 WGMMA is TN-only: both operands must be K-major");
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x64x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_32(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 128, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                  "SM90 FP8 WGMMA is TN-only: both operands must be K-major");
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x128x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_64(d_frag), scale_d);
+  }
+};
+
+template <Major TransposeA, Major TransposeB, ScaleIn scaleA, ScaleIn scaleB>
+struct WGMMA_ASYNC_SS<__nv_fp8_e4m3, float, 64, 256, 32, TransposeA, TransposeB, scaleA, scaleB> {
+  template <bool init>
+  static __device__ __forceinline__ void op(uint64_t desc_a, uint64_t desc_b, float* d_frag) {
+    static_assert(TransposeA == Major::K && TransposeB == Major::K,
+                  "SM90 FP8 WGMMA is TN-only: both operands must be K-major");
+    constexpr auto scale_d = init ? ScaleOut::Zero : ScaleOut::One;
+    MMA_64x256x32_F32E4M3E4M3_SS_TN<scaleA, scaleB>::fma(
+        desc_a, desc_b, EXPAND_FRAG_ARGS_128(d_frag), scale_d);
+  }
+};
+
 using Swizzle128B = cute::Swizzle<3, 4, 3>;
 using Swizzle64B = cute::Swizzle<2, 4, 3>;
 using Swizzle32B = cute::Swizzle<1, 4, 3>;
