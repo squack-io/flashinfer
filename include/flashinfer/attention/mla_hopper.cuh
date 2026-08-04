@@ -55,6 +55,10 @@ enum class NamedBarriers {
   // (consumer arrives after QK -> producer reads BF16 staging in PV).
   kConsumerDequantBegin = 4U,
   kConsumerDequantEnd = 5U,
+  // FP8 KV path only: consumer arrives once Q has been quantized out of the
+  // ckv staging buffer, which is what lets the producer start dequanting into
+  // it. Replaces the old full-CTA sync that used to serve the same purpose.
+  kQDrained = 6U,
 };
 
 __device__ __forceinline__ void barrier_arrive(int num_threads, NamedBarriers barrier) {
@@ -120,7 +124,8 @@ struct HopperSharedStorageQKVO {
       // FP8 QK path: CTA-wide amax of Q-nope, reduced in the consumer prologue.
       alignas(16) float q_amax[4];
       // Per-token CKV scales for the KV tile in flight (FP8 path only).
-      alignas(16) std::conditional_t<USE_KV_REPACK, float[CTA_TILE_KV], float[1]> kv_scale;
+      alignas(16) std::conditional_t<USE_KV_REPACK, float[NUM_STAGES][CTA_TILE_KV],
+                                     float[1][1]> kv_scale;
       alignas(16) float o_scale[CTA_TILE_Q];
       alignas(16) float m[CTA_TILE_Q];
       alignas(16) float d[CTA_TILE_Q];
@@ -182,6 +187,14 @@ struct HopperKernelTraits
   static constexpr uint32_t NUM_MMA_D_CKV_FP8 = HEAD_DIM_CKV_ / 32;
   static constexpr uint32_t UPCAST_STRIDE_Q_NOPE_FP8 = HEAD_DIM_CKV_ / upcast_size<DTypeKV_>();
   static constexpr uint32_t NUM_MMA_D_KPE_FP8 = HEAD_DIM_KPE_ / 32;
+  // Rows of the KV tile the producer wg dequants; the consumer takes the rest
+  // after its QK+softmax. The producer starts earlier, so it gets the larger
+  // share. Override at build time to sweep.
+#ifndef FLASHINFER_MLA_FP8_DEQUANT_SPLIT
+#define FLASHINFER_MLA_FP8_DEQUANT_SPLIT 40
+#endif
+  static constexpr uint32_t DEQUANT_SPLIT_ROWS =
+      (FLASHINFER_MLA_FP8_DEQUANT_SPLIT * CTA_TILE_KV_) / 64;
   // Q-nope lands as DTypeQ in the ckv_bf16 staging buffer before being
   // quantized, so that buffer must be at least as large and identically
   // swizzled.
@@ -384,13 +397,14 @@ __device__ __forceinline__ void gather_kv_scales(typename KTraits::SharedStorage
                                                  const uint32_t packed_kv_bound,
                                                  const uint_fastdiv& block_size,
                                                  typename KTraits::IdType* indices,
-                                                 const uint32_t tid, const uint32_t num_threads) {
+                                                 const uint32_t tid, const uint32_t num_threads,
+                                                 const uint32_t stage_idx) {
 #pragma unroll
   for (uint32_t t = tid; t < KTraits::CTA_TILE_KV; t += num_threads) {
     const uint32_t iter = packed_block_iter_base + t;
     uint32_t q, r;
     block_size.divmod(iter, q, r);
-    smem_storage->kv_scale[t] =
+    smem_storage->kv_scale[stage_idx][t] =
         iter < packed_kv_bound ? ckv_scale_arr[indices[q] * scale_stride_page + r] : 0.f;
   }
 }
@@ -400,21 +414,20 @@ __device__ __forceinline__ void gather_kv_scales(typename KTraits::SharedStorage
 // CKV only: KPE feeds the FP8 QK WGMMA raw, and PV never reads it.
 template <typename KTraits>
 __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedStorage* smem_storage,
-                                                      const uint32_t stage_idx,
-                                                      float ckv_scale, bool per_token) {
+                                                      const uint32_t stage_idx, float ckv_scale,
+                                                      bool per_token, uint32_t row_begin,
+                                                      uint32_t row_end) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
   static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
                 "repack_fp8_kv_to_bf16 only supports DTypeKV == __nv_fp8_e4m3");
 
-  // Both warpgroups dequant: the work is a pure strided copy and the producer
-  // wg would otherwise idle at the surrounding __syncthreads() with its TMA
-  // loads already issued. Callers in BOTH branches must invoke this, since the
-  // stride below assumes all NUM_THREADS threads participate.
-  // The helper has no internal barriers — the surrounding __syncthreads() at
-  // the call sites covers cross-wg synchronization.
-  const uint32_t thread_id = threadIdx.x;
-  const uint32_t num_threads = KTraits::NUM_THREADS;
+  // Each warpgroup dequants its own row range, so the two can run at different
+  // points in the iteration: the producer starts as soon as the stage lands,
+  // the consumer joins after its QK+softmax. QK reads the FP8 tile directly,
+  // so nothing here is on QK's critical path.
+  const uint32_t thread_id = threadIdx.x % KTraits::NUM_QK_THREADS;
+  const uint32_t num_threads = KTraits::NUM_QK_THREADS;
 
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
@@ -422,7 +435,8 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
   // b128 column counts (16-byte chunks per row).
   constexpr uint32_t FP8_COLS_CKV = HEAD_DIM_CKV / upcast_size<DTypeKV>();
   constexpr uint32_t BF16_COLS_CKV = HEAD_DIM_CKV / upcast_size<DTypeQ>();
-  constexpr uint32_t NUM_B128_CKV = CTA_TILE_KV * FP8_COLS_CKV;
+  const uint32_t b128_begin = row_begin * FP8_COLS_CKV;
+  const uint32_t b128_end = row_end * FP8_COLS_CKV;
 
   using packed2_t = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, nv_bfloat162>;
   packed2_t ckv_scale_packed{static_cast<DTypeQ>(ckv_scale), static_cast<DTypeQ>(ckv_scale)};
@@ -431,11 +445,11 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
   b128_t* src_ckv = (b128_t*)smem_storage->kv_o_smem[stage_idx].ckv;
   b128_t* dst_ckv = (b128_t*)smem_storage->ckv_bf16;
 #pragma unroll
-  for (uint32_t idx = thread_id; idx < NUM_B128_CKV; idx += num_threads) {
+  for (uint32_t idx = b128_begin + thread_id; idx < b128_end; idx += num_threads) {
     uint32_t row = idx / FP8_COLS_CKV, col = idx % FP8_COLS_CKV;
     if (per_token && row != scale_row) {
       scale_row = row;
-      const DTypeQ s = static_cast<DTypeQ>(smem_storage->kv_scale[row]);
+      const DTypeQ s = static_cast<DTypeQ>(smem_storage->kv_scale[stage_idx][row]);
       ckv_scale_packed = packed2_t{s, s};
     }
     b128_t packed =
@@ -629,7 +643,7 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
       for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG; ++i) {
         // Same register -> KV-column mapping logits_mask_ uses.
         const uint32_t kv_col = 2 * (lane_idx % 4) + 8 * (i / 4) + i % 2;
-        s_frag[i] *= qk_scale * smem_storage->kv_scale[kv_col] * inv_ckv_ref;
+        s_frag[i] *= qk_scale * smem_storage->kv_scale[stage_idx][kv_col] * inv_ckv_ref;
       }
     } else {
 #pragma unroll
@@ -1120,6 +1134,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
                                block_iter_base + kv_tile_idx * CTA_TILE_KV,
                                smem_pipe_write_kv.index(), ckv_offset, kpe_offset);
         PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadKV);
+        if constexpr (KTraits::USE_KV_REPACK) {
+          // Gather this stage's per-token scales here, not at dequant time: the
+          // load side is where the tile index is known, and committing after
+          // publishes them with the tile.
+          if (per_token_ckv) {
+            gather_kv_scales<KTraits>(&smem_storage, variant.ckv_scale_arr,
+                                      variant.ckv_scale_stride_page,
+                                      block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                                      block_size, kv_indices, threadIdx.x % KTraits::NUM_COPY_THREADS,
+                                      KTraits::NUM_COPY_THREADS, smem_pipe_write_kv.index());
+          }
+        }
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
         kv_tile_idx -= 1;
         ++smem_pipe_write_kv;
@@ -1139,6 +1165,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadQ);
       pipeline_q.producer_commit(smem_pipe_write_q, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_q;
+      if constexpr (KTraits::USE_KV_REPACK) {
+        // Q-nope lands in the ckv staging buffer, so this wg must not dequant
+        // into it until the consumer has quantized Q out.
+        barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kQDrained);
+      }
 
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
@@ -1153,6 +1184,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
                                    packed_kv_bound, ckv_stride_page, ckv_stride_n, kpe_stride_page,
                                    kpe_stride_n, block_size, kv_indices, ckv_offset, kpe_offset);
         }
+        if constexpr (KTraits::USE_KV_REPACK) {
+          if (per_token_ckv) {
+            gather_kv_scales<KTraits>(&smem_storage, variant.ckv_scale_arr,
+                                      variant.ckv_scale_stride_page,
+                                      block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                                      block_size, kv_indices, threadIdx.x % KTraits::NUM_COPY_THREADS,
+                                      KTraits::NUM_COPY_THREADS, smem_pipe_write_kv.index());
+          }
+        }
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_kv;
 
@@ -1163,16 +1203,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           // matching wait. Idempotent with the consumer_wait before the PV
           // WGMMA below (same pipeline state, already-satisfied barrier).
           consumer_wait(pipeline_kv, smem_pipe_read_kv);
-          // d1: pair with consumer's s1 (consumer is at __syncthreads_pre_dequant
-          // right after its own consumer_wait).
-          __syncthreads();
-          // Both wgs dequant FP8 KV -> BF16 staging; see repack_fp8_kv_to_bf16.
+          // This wg's share of the dequant, run while the consumer is in QK and
+          // softmax. The pre-PV __syncthreads() below is what makes it visible.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv);
-          // d2: pair with consumer's s2 (post-dequant). Once we cross this
-          // barrier, the BF16 staging buffer has the current stage's data and
-          // is safe to read in the PV WGMMA below.
-          __syncthreads();
+                                         variant.ckv_scale, per_token_ckv, 0,
+                                         KTraits::DEQUANT_SPLIT_ROWS);
         }
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         load_o_scale_smem<KTraits>(&smem_storage, o_scale);
@@ -1203,16 +1238,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           // matching wait. Idempotent with the consumer_wait before the PV
           // WGMMA below (same pipeline state, already-satisfied barrier).
           consumer_wait(pipeline_kv, smem_pipe_read_kv);
-          // d1: pair with consumer's s1 (consumer is at __syncthreads_pre_dequant
-          // right after its own consumer_wait).
-          __syncthreads();
-          // Both wgs dequant FP8 KV -> BF16 staging; see repack_fp8_kv_to_bf16.
+          // This wg's share of the dequant, run while the consumer is in QK and
+          // softmax. The pre-PV __syncthreads() below is what makes it visible.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv);
-          // d2: pair with consumer's s2 (post-dequant). Once we cross this
-          // barrier, the BF16 staging buffer has the current stage's data and
-          // is safe to read in the PV WGMMA below.
-          __syncthreads();
+                                         variant.ckv_scale, per_token_ckv, 0,
+                                         KTraits::DEQUANT_SPLIT_ROWS);
         }
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         load_o_scale_smem<KTraits>(&smem_storage, o_scale);
@@ -1290,31 +1320,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       consumer_wait(pipeline_q, smem_pipe_read_q);
       float qk_scale = 1.f;
       if constexpr (KTraits::USE_KV_REPACK) {
-        // Must precede this warpgroup's first __syncthreads() below: that is
-        // what holds the producer warpgroup out of the ckv staging buffer
-        // until Q has been drained out of it.
         qk_scale = quantize_q_fp8<KTraits>(&smem_storage, variant.ckv_scale, variant.kpe_scale);
+        barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kQDrained);
       }
 #pragma unroll 1
       for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        if constexpr (KTraits::USE_KV_REPACK) {
-          if (per_token_ckv) {
-            gather_kv_scales<KTraits>(&smem_storage, variant.ckv_scale_arr,
-                                      variant.ckv_scale_stride_page,
-                                      block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
-                                      block_size, kv_indices, threadIdx.x % KTraits::NUM_QK_THREADS,
-                                      KTraits::NUM_QK_THREADS);
-          }
-          // s1: pair with producer's d1 (matches per-iter __syncthreads count).
-          __syncthreads();
-          // Both wgs dequant FP8 KV -> BF16 staging buffers; the producer wg
-          // makes the matching call in its own d1/d2 bracket.
-          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv);
-          // s2: ensures dequant is complete before any wg reads BF16 staging.
-          __syncthreads();
-        }
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag, qk_scale,
                                 inv_ckv_ref);
@@ -1333,6 +1344,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
         PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
+        if constexpr (KTraits::USE_KV_REPACK) {
+          // This wg's share, after QK+softmax; the producer has been working on
+          // its own rows since the tile landed.
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, per_token_ckv,
+                                         KTraits::DEQUANT_SPLIT_ROWS, KTraits::CTA_TILE_KV);
+        }
         __syncthreads();
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
@@ -1351,23 +1369,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx + 1 > NUM_STAGES; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        if constexpr (KTraits::USE_KV_REPACK) {
-          if (per_token_ckv) {
-            gather_kv_scales<KTraits>(&smem_storage, variant.ckv_scale_arr,
-                                      variant.ckv_scale_stride_page,
-                                      block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
-                                      block_size, kv_indices, threadIdx.x % KTraits::NUM_QK_THREADS,
-                                      KTraits::NUM_QK_THREADS);
-          }
-          // s1: pair with producer's d1 (matches per-iter __syncthreads count).
-          __syncthreads();
-          // Both wgs dequant FP8 KV -> BF16 staging buffers; the producer wg
-          // makes the matching call in its own d1/d2 bracket.
-          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv);
-          // s2: ensures dequant is complete before any wg reads BF16 staging.
-          __syncthreads();
-        }
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag, qk_scale,
                                 inv_ckv_ref);
@@ -1383,6 +1384,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
         PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
+        if constexpr (KTraits::USE_KV_REPACK) {
+          // This wg's share, after QK+softmax; the producer has been working on
+          // its own rows since the tile landed.
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, per_token_ckv,
+                                         KTraits::DEQUANT_SPLIT_ROWS, KTraits::CTA_TILE_KV);
+        }
         __syncthreads();
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
@@ -1401,23 +1409,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        if constexpr (KTraits::USE_KV_REPACK) {
-          if (per_token_ckv) {
-            gather_kv_scales<KTraits>(&smem_storage, variant.ckv_scale_arr,
-                                      variant.ckv_scale_stride_page,
-                                      block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
-                                      block_size, kv_indices, threadIdx.x % KTraits::NUM_QK_THREADS,
-                                      KTraits::NUM_QK_THREADS);
-          }
-          // s1: pair with producer's d1 (matches per-iter __syncthreads count).
-          __syncthreads();
-          // Both wgs dequant FP8 KV -> BF16 staging buffers; the producer wg
-          // makes the matching call in its own d1/d2 bracket.
-          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv);
-          // s2: ensures dequant is complete before any wg reads BF16 staging.
-          __syncthreads();
-        }
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag, qk_scale,
                                 inv_ckv_ref);
@@ -1435,6 +1426,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
         PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
+        if constexpr (KTraits::USE_KV_REPACK) {
+          // This wg's share, after QK+softmax; the producer has been working on
+          // its own rows since the tile landed.
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, per_token_ckv,
+                                         KTraits::DEQUANT_SPLIT_ROWS, KTraits::CTA_TILE_KV);
+        }
         __syncthreads();
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
