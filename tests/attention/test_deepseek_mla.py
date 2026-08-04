@@ -812,8 +812,9 @@ def _run_mla(
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize("num_heads", [16, 128])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float16])
 def test_batch_mla_fp8_kv_matches_bf16_reference(
-    batch_size, kv_len, qo_len, page_size, num_heads, causal
+    batch_size, kv_len, qo_len, page_size, num_heads, causal, q_dtype
 ):
     """For random FP8 KV with per-tensor scales, the FP8-KV kernel output
     must match the BF16 reference (run on the BF16-dequant of the same FP8
@@ -834,7 +835,7 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
             num_heads,
             HEAD_DIM_CKV,
             device=device,
-            dtype=torch.bfloat16,
+            dtype=q_dtype,
         )
         * 0.1
     )
@@ -844,7 +845,7 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
             num_heads,
             HEAD_DIM_KPE,
             device=device,
-            dtype=torch.bfloat16,
+            dtype=q_dtype,
         )
         * 0.1
     )
@@ -855,8 +856,8 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
     ckv_fp8, ckv_scale = _per_tensor_symmetric_quant_fp8(ckv_fp32)
     kpe_fp8, kpe_scale = _per_tensor_symmetric_quant_fp8(kpe_fp32)
 
-    ckv_ref = _ref_dequant_to_bf16(ckv_fp8, ckv_scale)
-    kpe_ref = _ref_dequant_to_bf16(kpe_fp8, kpe_scale)
+    ckv_ref = _ref_dequant_to_bf16(ckv_fp8, ckv_scale).to(q_dtype)
+    kpe_ref = _ref_dequant_to_bf16(kpe_fp8, kpe_scale).to(q_dtype)
 
     qo_indptr = (
         torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * qo_len
@@ -883,8 +884,8 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
         page_size=page_size,
         causal=causal,
         sm_scale=sm_scale,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        q_dtype=q_dtype,
+        kv_dtype=q_dtype,
     )
 
     o_fp8 = _run_mla(
@@ -901,7 +902,7 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
         page_size=page_size,
         causal=causal,
         sm_scale=sm_scale,
-        q_dtype=torch.bfloat16,
+        q_dtype=q_dtype,
         kv_dtype=torch.float8_e4m3fn,
         ckv_scale=ckv_scale,
         kpe_scale=kpe_scale,
@@ -1217,19 +1218,21 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
     )
 
 
-def test_fp8_kv_plan_rejects_fp16_q():
-    """FP8 KV MLA is BF16-Q only; FP16 Q must be rejected at plan() time
-    with a clear ValueError."""
+def test_fp8_kv_plan_accepts_fp16_q():
+    """FP8 KV MLA takes BF16 or FP16 Q. FP16 is preferred on SM90: the FP8
+    dequant lowers to the native cvt.rn.f16x2.e4m3x2, which has no BF16
+    counterpart."""
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
     device = torch.device("cuda:0")
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa3")
     qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
     kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
     kv_indices = torch.tensor([0], dtype=torch.int32, device=device)
     kv_len_arr = torch.tensor([64], dtype=torch.int32, device=device)
-    with pytest.raises(ValueError, match="q_data_type=torch.bfloat16"):
+
+    for q_data_type in (torch.float16, torch.bfloat16):
+        wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa3")
         wrapper.plan(
             qo_indptr,
             kv_indptr,
@@ -1241,10 +1244,9 @@ def test_fp8_kv_plan_rejects_fp16_q():
             page_size=64,
             causal=False,
             sm_scale=1.0,
-            q_data_type=torch.float16,
+            q_data_type=q_data_type,
             kv_data_type=torch.float8_e4m3fn,
         )
-
 
 def test_fp8_kv_scales_are_keyword_only():
     """ckv_scale / kpe_scale must be passed by keyword. The `*` marker
