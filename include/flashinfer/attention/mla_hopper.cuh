@@ -414,9 +414,8 @@ __device__ __forceinline__ void gather_kv_scales(typename KTraits::SharedStorage
 // CKV only: KPE feeds the FP8 QK WGMMA raw, and PV never reads it.
 template <typename KTraits>
 __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedStorage* smem_storage,
-                                                      const uint32_t stage_idx, float ckv_scale,
-                                                      bool per_token, uint32_t row_begin,
-                                                      uint32_t row_end) {
+                                                      const uint32_t stage_idx,
+                                                      uint32_t row_begin, uint32_t row_end) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
   static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
@@ -438,29 +437,16 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
   const uint32_t b128_begin = row_begin * FP8_COLS_CKV;
   const uint32_t b128_end = row_end * FP8_COLS_CKV;
 
-  using packed2_t = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, nv_bfloat162>;
-  packed2_t ckv_scale_packed{static_cast<DTypeQ>(ckv_scale), static_cast<DTypeQ>(ckv_scale)};
-  uint32_t scale_row = ~0u;
-
   b128_t* src_ckv = (b128_t*)smem_storage->kv_o_smem[stage_idx].ckv;
   b128_t* dst_ckv = (b128_t*)smem_storage->ckv_bf16;
 #pragma unroll
   for (uint32_t idx = b128_begin + thread_id; idx < b128_end; idx += num_threads) {
     uint32_t row = idx / FP8_COLS_CKV, col = idx % FP8_COLS_CKV;
-    if (per_token && row != scale_row) {
-      scale_row = row;
-      const DTypeQ s = static_cast<DTypeQ>(smem_storage->kv_scale[stage_idx][row]);
-      ckv_scale_packed = packed2_t{s, s};
-    }
     b128_t packed =
         src_ckv[get_swizzle_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV>(row,
                                                                                           col)];
     alignas(16) DTypeQ conv[16];
     vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
-#pragma unroll
-    for (uint32_t k = 0; k < 8; ++k) {
-      ((packed2_t*)&conv[0])[k] = __hmul2(((packed2_t*)&conv[0])[k], ckv_scale_packed);
-    }
     dst_ckv[get_swizzle_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV_BF16>(
         row, 2 * col)] = *(b128_t*)&conv[0];
     dst_ckv[get_swizzle_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV_BF16>(
@@ -968,10 +954,26 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
 }
 
 template <typename KTraits>
-__device__ __forceinline__ void convert_s_to_p(float* s_frag, uint32_t* p_frag) {
+__device__ __forceinline__ void convert_s_to_p(float* s_frag, uint32_t* p_frag,
+                                              typename KTraits::SharedStorage* smem_storage,
+                                              const uint32_t stage_idx, float ckv_scale,
+                                              bool per_token) {
   // P is always DTypeQ-typed in shmem (see HopperSharedStorageQKVO::kv_o_smem.p)
   // so the PV WGMMA can run as BF16xBF16 on the FP8 KV path. On the BF16 KV
   // path DTypeQ == DTypeKV so this is unchanged.
+  //
+  // FP8 KV: o = sum_t P[q,t] * s[t] * V_fp8[t,d], so the KV dequant scale is a
+  // per-column factor on P (64x64) rather than on V (64x512) -- 8x fewer
+  // multiplies, and it leaves the dequant a pure convert. Must run after
+  // update_md_, whose denominator is the sum of *unscaled* P.
+  if constexpr (KTraits::USE_KV_REPACK) {
+    const uint32_t lane_idx = cutlass::canonical_lane_idx();
+#pragma unroll
+    for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG; ++i) {
+      const uint32_t kv_col = 2 * (lane_idx % 4) + 8 * (i / 4) + i % 2;
+      s_frag[i] *= per_token ? smem_storage->kv_scale[stage_idx][kv_col] : ckv_scale;
+    }
+  }
 #pragma unroll
   for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG / 8; ++i) {
     vec_cast<typename KTraits::DTypeQ, float>::cast<8>(((typename KTraits::DTypeQ*)p_frag) + i * 8,
@@ -1205,8 +1207,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           consumer_wait(pipeline_kv, smem_pipe_read_kv);
           // This wg's share of the dequant, run while the consumer is in QK and
           // softmax. The pre-PV __syncthreads() below is what makes it visible.
-          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv, 0,
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(), 0,
                                          KTraits::DEQUANT_SPLIT_ROWS);
         }
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
@@ -1240,8 +1241,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           consumer_wait(pipeline_kv, smem_pipe_read_kv);
           // This wg's share of the dequant, run while the consumer is in QK and
           // softmax. The pre-PV __syncthreads() below is what makes it visible.
-          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv, 0,
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(), 0,
                                          KTraits::DEQUANT_SPLIT_ROWS);
         }
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
@@ -1338,7 +1338,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
         write_o_scale_smem<KTraits>(&smem_storage, o_scale);
 
-        convert_s_to_p<KTraits>(s_frag, p_frag);
+        convert_s_to_p<KTraits>(s_frag, p_frag, &smem_storage, smem_pipe_read_kv.index(),
+                                variant.ckv_scale, per_token_ckv);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
@@ -1348,7 +1349,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           // This wg's share, after QK+softmax; the producer has been working on
           // its own rows since the tile landed.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv,
                                          KTraits::DEQUANT_SPLIT_ROWS, KTraits::CTA_TILE_KV);
         }
         __syncthreads();
@@ -1378,7 +1378,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
         PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
         write_o_scale_smem<KTraits>(&smem_storage, o_scale);
-        convert_s_to_p<KTraits>(s_frag, p_frag);
+        convert_s_to_p<KTraits>(s_frag, p_frag, &smem_storage, smem_pipe_read_kv.index(),
+                                variant.ckv_scale, per_token_ckv);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
@@ -1388,7 +1389,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           // This wg's share, after QK+softmax; the producer has been working on
           // its own rows since the tile landed.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv,
                                          KTraits::DEQUANT_SPLIT_ROWS, KTraits::CTA_TILE_KV);
         }
         __syncthreads();
@@ -1420,7 +1420,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
         PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
         write_o_scale_smem<KTraits>(&smem_storage, o_scale);
-        convert_s_to_p<KTraits>(s_frag, p_frag);
+        convert_s_to_p<KTraits>(s_frag, p_frag, &smem_storage, smem_pipe_read_kv.index(),
+                                variant.ckv_scale, per_token_ckv);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
@@ -1430,7 +1431,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           // This wg's share, after QK+softmax; the producer has been working on
           // its own rows since the tile landed.
           repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
-                                         variant.ckv_scale, per_token_ckv,
                                          KTraits::DEQUANT_SPLIT_ROWS, KTraits::CTA_TILE_KV);
         }
         __syncthreads();
