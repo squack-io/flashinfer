@@ -36,6 +36,8 @@ struct StandardAttention : AttentionVariantBase {
   // the BF16/FP16 path so they are no-ops there.
   float ckv_scale;
   float kpe_scale;
+  float* ckv_scale_arr;
+  uint32_t ckv_scale_stride_page;
 
   PROFILER_CLOSURE_PARAMS_DECL
 
@@ -45,6 +47,8 @@ struct StandardAttention : AttentionVariantBase {
     sm_scale_log2 = params.sm_scale * math::log2e;
     ckv_scale = params.ckv_scale;
     kpe_scale = params.kpe_scale;
+    ckv_scale_arr = params.ckv_scale_arr;
+    ckv_scale_stride_page = params.ckv_scale_stride_page;
   }
 };
 

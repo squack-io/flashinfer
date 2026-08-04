@@ -1741,6 +1741,7 @@ class BatchMLAPagedAttentionWrapper:
         *,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
+        ckv_scale_arr: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -1890,7 +1891,26 @@ class BatchMLAPagedAttentionWrapper:
                 raise ValueError(
                     f"kpe_scale must be a finite positive value, got {kpe_scale}"
                 )
+            if ckv_scale_arr is not None:
+                # Per-token CKV scales, paged like ckv_cache. ckv_scale stays
+                # the reference the kernel picks its Q accumulator scale from.
+                if ckv_scale_arr.dtype != torch.float32:
+                    raise ValueError(
+                        f"ckv_scale_arr must be float32, got {ckv_scale_arr.dtype}"
+                    )
+                if ckv_scale_arr.shape != ckv_cache.shape[:2]:
+                    raise ValueError(
+                        f"ckv_scale_arr must be shaped like the first two dims of "
+                        f"ckv_cache {tuple(ckv_cache.shape[:2])}, got "
+                        f"{tuple(ckv_scale_arr.shape)}"
+                    )
+                if self._backend != "fa3":
+                    raise ValueError("ckv_scale_arr requires the fa3 backend.")
         else:
+            if ckv_scale_arr is not None:
+                raise ValueError(
+                    "ckv_scale_arr is only valid when kv_data_type is FP8."
+                )
             if ckv_scale is not None or kpe_scale is not None:
                 raise ValueError(
                     "ckv_scale / kpe_scale are only valid when kv_data_type is FP8."
@@ -1942,6 +1962,7 @@ class BatchMLAPagedAttentionWrapper:
             return_lse_base_on_e,
             ckv_scale_f,
             kpe_scale_f,
+            ckv_scale_arr,
             *profiler_args,
         )
 

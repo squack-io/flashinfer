@@ -76,6 +76,11 @@ struct MLAParams {
   // dequantized = ckv_scale * static_cast<float>(ckv_fp8); same for kpe.
   float ckv_scale = 1.f;
   float kpe_scale = 1.f;
+  // Optional per-token CKV scales, paged like the cache itself:
+  // ckv_scale_arr[page * ckv_scale_stride_page + entry]. When non-null it
+  // replaces ckv_scale; kpe_scale stays per-tensor either way.
+  float* ckv_scale_arr = nullptr;
+  uint32_t ckv_scale_stride_page = 0;
   bool return_lse_base_on_e;
 };
 
