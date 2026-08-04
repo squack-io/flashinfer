@@ -95,7 +95,13 @@ struct HopperSharedStorageQKVO {
   struct {
     struct {
       struct {
-        alignas(16) DTypeQ nope[CTA_TILE_Q * HEAD_DIM_CKV];
+        // FP8 QK path: Q-nope is stored quantized to FP8 so the QK WGMMA can
+        // consume it directly (SM90 FP8 WGMMA is e4m3xe4m3 -- there is no
+        // mixed FP8x16-bit form). It lands as DTypeQ in the ckv_bf16 staging
+        // buffer and is quantized into here in the consumer prologue, which
+        // also halves this buffer from 64KB to 32KB.
+        alignas(16) std::conditional_t<USE_KV_REPACK, DTypeKV[CTA_TILE_Q * HEAD_DIM_CKV],
+                                       DTypeQ[CTA_TILE_Q * HEAD_DIM_CKV]> nope;
         alignas(16) DTypeQ pe[CTA_TILE_Q * HEAD_DIM_KPE];
       } q_smem;
       union {
@@ -110,6 +116,8 @@ struct HopperSharedStorageQKVO {
         };
         alignas(16) DTypeO o[CTA_TILE_Q * HEAD_DIM_CKV];
       };
+      // FP8 QK path: CTA-wide amax of Q-nope, reduced in the consumer prologue.
+      alignas(16) float q_amax[4];
       alignas(16) float o_scale[CTA_TILE_Q];
       alignas(16) float m[CTA_TILE_Q];
       alignas(16) float d[CTA_TILE_Q];
@@ -164,6 +172,17 @@ struct HopperKernelTraits
   // BF16 path is unaffected (KPE_B128_PER_ROW=8, k128B already correct).
   static constexpr SwizzleMode SWIZZLE_MODE_KPE_RAW =
       (USE_KV_REPACK && KPE_B128_PER_ROW < 8) ? SwizzleMode::k64B : SwizzleMode::k128B;
+  // FP8 QK: MMA-K is 32 for e4m3 (vs 16 for 16-bit), so the CKV contraction
+  // takes half as many WGMMA steps. The descriptor stepping is unchanged --
+  // one step is 32 bytes either way, and 4 steps still span one 128B swizzle
+  // atom.
+  static constexpr uint32_t NUM_MMA_D_CKV_FP8 = HEAD_DIM_CKV_ / 32;
+  static constexpr uint32_t UPCAST_STRIDE_Q_NOPE_FP8 = HEAD_DIM_CKV_ / upcast_size<DTypeKV_>();
+  // Q-nope lands as DTypeQ in the ckv_bf16 staging buffer before being
+  // quantized, so that buffer must be at least as large and identically
+  // swizzled.
+  static_assert(!USE_KV_REPACK || CTA_TILE_Q_ <= CTA_TILE_KV_,
+                "FP8 QK path lands Q-nope in the ckv staging buffer: needs CTA_TILE_Q<=CTA_TILE_KV");
   using MainloopPipeline = cutlass::PipelineAsync<NUM_STAGES_>;
   using SharedStorage =
       HopperSharedStorageQKVO<MainloopPipeline, NUM_STAGES_, CTA_TILE_Q_, CTA_TILE_KV_,
@@ -200,7 +219,12 @@ __device__ __forceinline__ void load_q(
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
 
-  smem_t<KTraits::SWIZZLE_MODE_Q_NOPE> q_smem_nope(smem_storage->q_smem.nope);
+  // On the FP8 QK path q_smem.nope is FP8-typed; the DTypeQ values from global
+  // land in the ckv_bf16 staging buffer (same shape, same k128B swizzle, and
+  // free until the first KV dequant) and are quantized from there.
+  DTypeQ* q_nope_dst = KTraits::USE_KV_REPACK ? (DTypeQ*)smem_storage->ckv_bf16
+                                              : (DTypeQ*)smem_storage->q_smem.nope;
+  smem_t<KTraits::SWIZZLE_MODE_Q_NOPE> q_smem_nope(q_nope_dst);
   smem_t<KTraits::SWIZZLE_MODE_Q_PE> q_smem_pe(smem_storage->q_smem.pe);
 
 #pragma unroll
@@ -419,9 +443,87 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
   }
 }
 
+// FP8 QK path: quantize Q-nope from the DTypeQ landing zone (ckv_bf16) into
+// the FP8 q_smem.nope the QK WGMMA reads directly. Consumer warpgroup only --
+// it runs after consumer_wait(pipeline_q) and before the first
+// __syncthreads() of the KV loop, which is what keeps the producer warpgroup
+// out of the staging buffer until the quantize has drained it.
+//
+// Scale: per-CTA amax/448, returned so the caller can fold q_scale*ckv_scale
+// into the FP32 accumulator between the two WGMMA groups (see compute_mla_qk).
+template <typename KTraits>
+__device__ __forceinline__ float quantize_q_nope_fp8(
+    typename KTraits::SharedStorage* smem_storage) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  using DTypeKV = typename KTraits::DTypeKV;
+  constexpr uint32_t NUM_QK_THREADS = KTraits::NUM_QK_THREADS;
+  constexpr uint32_t FP8_COLS = KTraits::HEAD_DIM_CKV / upcast_size<DTypeKV>();
+  constexpr uint32_t NUM_B128 = KTraits::CTA_TILE_Q * FP8_COLS;
+  constexpr auto SW = KTraits::SWIZZLE_MODE_Q_NOPE;
+  constexpr uint32_t STRIDE_Q = KTraits::UPCAST_STRIDE_Q_NOPE;
+  constexpr uint32_t STRIDE_F8 = KTraits::UPCAST_STRIDE_Q_NOPE_FP8;
+
+  const uint32_t tid = threadIdx.x % NUM_QK_THREADS;
+  b128_t* src = (b128_t*)smem_storage->ckv_bf16;
+  b128_t* dst = (b128_t*)smem_storage->q_smem.nope;
+
+  if (tid == 0) {
+    smem_storage->q_amax[0] = 0.f;
+  }
+  barrier_sync(NUM_QK_THREADS, NamedBarriers::kConsumerDequantBegin);
+
+  float local_amax = 0.f;
+#pragma unroll 1
+  for (uint32_t idx = tid; idx < NUM_B128; idx += NUM_QK_THREADS) {
+    const uint32_t row = idx / FP8_COLS, col = idx % FP8_COLS;
+    b128_t lo = src[get_swizzle_offset<SW, STRIDE_Q>(row, 2 * col)];
+    b128_t hi = src[get_swizzle_offset<SW, STRIDE_Q>(row, 2 * col + 1)];
+    float f[16];
+    vec_cast<float, DTypeQ>::template cast<8>(f, (DTypeQ*)&lo);
+    vec_cast<float, DTypeQ>::template cast<8>(f + 8, (DTypeQ*)&hi);
+#pragma unroll
+    for (uint32_t k = 0; k < 16; ++k) {
+      local_amax = max(local_amax, fabsf(f[k]));
+    }
+  }
+#pragma unroll
+  for (uint32_t off = 16; off > 0; off >>= 1) {
+    local_amax = max(local_amax, math::shfl_xor_sync(local_amax, off));
+  }
+  if ((tid & 31) == 0) {
+    // amax is non-negative, so the IEEE bit pattern orders like the value.
+    atomicMax((int*)&smem_storage->q_amax[0], __float_as_int(local_amax));
+  }
+  barrier_sync(NUM_QK_THREADS, NamedBarriers::kConsumerDequantEnd);
+
+  const float amax = smem_storage->q_amax[0];
+  const float q_scale = (amax > 0.f) ? amax * (1.f / 448.f) : 1.f;
+  const float inv_scale = 1.f / q_scale;
+
+#pragma unroll 1
+  for (uint32_t idx = tid; idx < NUM_B128; idx += NUM_QK_THREADS) {
+    const uint32_t row = idx / FP8_COLS, col = idx % FP8_COLS;
+    b128_t lo = src[get_swizzle_offset<SW, STRIDE_Q>(row, 2 * col)];
+    b128_t hi = src[get_swizzle_offset<SW, STRIDE_Q>(row, 2 * col + 1)];
+    float f[16];
+    vec_cast<float, DTypeQ>::template cast<8>(f, (DTypeQ*)&lo);
+    vec_cast<float, DTypeQ>::template cast<8>(f + 8, (DTypeQ*)&hi);
+#pragma unroll
+    for (uint32_t k = 0; k < 16; ++k) {
+      f[k] *= inv_scale;
+    }
+    alignas(16) DTypeKV out[16];
+    vec_cast<DTypeKV, float>::template cast<16>(out, f);
+    dst[get_swizzle_offset<SW, STRIDE_F8>(row, col)] = *(b128_t*)&out[0];
+  }
+  barrier_sync(NUM_QK_THREADS, NamedBarriers::kConsumerDequantBegin);
+  return q_scale;
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* smem_storage,
-                                               const uint32_t stage_idx, float* s_frag) {
+                                               const uint32_t stage_idx, float* s_frag,
+                                               const float qk_scale) {
   // After dequant, the BF16 staging buffers feed the WGMMA on the FP8 KV path;
   // otherwise the per-stage native BF16 buffers are used directly.
   using KVDescType = std::conditional_t<KTraits::USE_KV_REPACK, typename KTraits::DTypeQ,
@@ -441,11 +543,59 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   using wgmma = WGMMA_ASYNC_SS<KVDescType, float, 64, KTraits::CTA_TILE_KV, 16, Major::K, Major::K,
                                ScaleIn::One, ScaleIn::One>;
 
+  if constexpr (KTraits::USE_KV_REPACK) {
+    // CKV (512 dims, 94% of the QK work) straight off the FP8 cache: SM90 FP8
+    // WGMMA is TN-only and the cache is already K-major, so no transpose and
+    // no dequant. Q-nope was quantized to FP8 in the prologue.
+    using DTypeKV = typename KTraits::DTypeKV;
+    auto desc_q_f8 =
+        make_smem_desc<KTraits::SWIZZLE_MODE_Q_NOPE, /*leading_byte_offset=*/16,
+                       /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 8, DTypeKV>(
+            (DTypeKV*)smem_storage->q_smem.nope);
+    auto desc_ckv_f8 =
+        make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
+                       /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 8, DTypeKV>(
+            (DTypeKV*)smem_storage->kv_o_smem[stage_idx].ckv);
+    using wgmma_f8 = WGMMA_ASYNC_SS<DTypeKV, float, 64, KTraits::CTA_TILE_KV, 32, Major::K,
+                                    Major::K, ScaleIn::One, ScaleIn::One>;
+    warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
+    warpgroup_arrive();
+#pragma unroll
+    for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV_FP8; ++mma_d) {
+      if (mma_d == 0) {
+        wgmma_f8::op</*init=*/true>(desc_q_f8, desc_ckv_f8, s_frag);
+      } else {
+        wgmma_f8::op</*init=*/false>(desc_q_f8, desc_ckv_f8, s_frag);
+      }
+      // One MMA-K step is 32 bytes for FP8 as it is for 16-bit, and 4 steps
+      // still cross one 128B swizzle atom (1024 bytes) -- identical stepping.
+      if ((mma_d + 1) % 4 == 0) {
+        desc_q_f8 += 64 - 6;
+        desc_ckv_f8 += 64 - 6;
+      } else {
+        desc_q_f8 += 2;
+        desc_ckv_f8 += 2;
+      }
+    }
+    warpgroup_commit_batch();
+    warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
+    warpgroup_wait<0>();
+    // Fold q_scale*ckv_scale into the accumulator here rather than into
+    // sm_scale: the KPE term below arrives already dequantized (kpe_scale
+    // applied in the repack), so the two contributions do not share a scale.
+    // Doing it in FP32 between the groups avoids pre-scaling any 16-bit
+    // operand, which would overflow for realistic scale magnitudes.
+#pragma unroll
+    for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG; ++i) {
+      s_frag[i] *= qk_scale;
+    }
+  }
+
   warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
   warpgroup_arrive();
 #pragma unroll
   for (uint32_t mma_d_pe = 0; mma_d_pe < KTraits::NUM_MMA_D_KPE; ++mma_d_pe) {
-    if (mma_d_pe == 0) {
+    if (mma_d_pe == 0 && !KTraits::USE_KV_REPACK) {
       wgmma::op</*init=*/true>(desc_q_pe, desc_k_pe, s_frag);
     } else {
       wgmma::op</*init=*/false>(desc_q_pe, desc_k_pe, s_frag);
@@ -462,13 +612,14 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   auto desc_q_nope =
       make_smem_desc<KTraits::SWIZZLE_MODE_Q_NOPE, /*leading_byte_offset=*/16,
                      /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, typename KTraits::DTypeQ>(
-          smem_storage->q_smem.nope);
+          (typename KTraits::DTypeQ*)smem_storage->q_smem.nope);
   auto desc_ckv =
       make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
                      /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, KVDescType>(ckv_smem_ptr);
 
 #pragma unroll
-  for (uint32_t mma_d_ckv = 0; mma_d_ckv < KTraits::NUM_MMA_D_CKV; ++mma_d_ckv) {
+  for (uint32_t mma_d_ckv = 0; mma_d_ckv < (KTraits::USE_KV_REPACK ? 0 : KTraits::NUM_MMA_D_CKV);
+       ++mma_d_ckv) {
     wgmma::op</*init=*/false>(desc_q_nope, desc_ckv, s_frag);
     if ((mma_d_ckv + 1) % 4 == 0) {
       desc_q_nope += 64 - 6;
@@ -1070,6 +1221,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           (kv_start / CTA_TILE_KV);
 
       consumer_wait(pipeline_q, smem_pipe_read_q);
+      float qk_scale = 1.f;
+      if constexpr (KTraits::USE_KV_REPACK) {
+        // Must precede this warpgroup's first __syncthreads() below: that is
+        // what holds the producer warpgroup out of the ckv staging buffer
+        // until Q has been drained out of it.
+        qk_scale = quantize_q_nope_fp8<KTraits>(&smem_storage) * variant.ckv_scale;
+      }
 #pragma unroll 1
       for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
@@ -1084,7 +1242,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
         }
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
-        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
+        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag, qk_scale);
         warpgroup_wait<0>();
         PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
         logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
@@ -1129,7 +1287,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
         }
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
-        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
+        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag, qk_scale);
         warpgroup_wait<0>();
         PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
         PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
@@ -1171,7 +1329,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
         }
         PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
-        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
+        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag, qk_scale);
         warpgroup_wait<0>();
         PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
         logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
