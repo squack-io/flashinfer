@@ -583,10 +583,10 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
     using wgmma = WGMMA_ASYNC_SS<DTypeKV, float, 64, KTraits::CTA_TILE_KV, 32, Major::K, Major::K,
                                  ScaleIn::One, ScaleIn::One>;
 
-    // Per-token CKV scales are a per-column (per-KV-token) factor, so unlike
-    // the per-tensor scales they cannot fold into Q -- the contraction is over
-    // dims. Run the CKV half alone, scale the accumulator, then accumulate the
-    // KPE half on top, which keeps its own per-tensor scale in Q as before.
+    // The per-token scale spans all 576 dims, so it is one per-column factor on
+    // the finished logit: both halves accumulate, then a single rescale folds it
+    // into qk_scale. (Per-column cannot fold into Q -- the contraction is over
+    // dims, not tokens.)
     const bool per_token = inv_ckv_ref != 0.f;
 
     warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
@@ -611,18 +611,6 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
     warpgroup_commit_batch();
     warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
 
-    if (per_token) {
-      warpgroup_wait<0>();
-      const uint32_t lane_idx = cutlass::canonical_lane_idx();
-#pragma unroll
-      for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG; ++i) {
-        // Same register -> KV-column mapping logits_mask_ uses.
-        const uint32_t kv_col = 2 * (lane_idx % 4) + 8 * (i / 4) + i % 2;
-        s_frag[i] *= smem_storage->kv_scale[kv_col] * inv_ckv_ref;
-      }
-      warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
-    }
-
     warpgroup_arrive();
     // KPE is 64 dims = 2 MMA-K steps, and its k64B atom is 4 b128 wide, so the
     // loop never crosses an atom.
@@ -635,9 +623,19 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
     warpgroup_commit_batch();
     warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
     warpgroup_wait<0>();
+    if (per_token) {
+      const uint32_t lane_idx = cutlass::canonical_lane_idx();
 #pragma unroll
-    for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG; ++i) {
-      s_frag[i] *= qk_scale;
+      for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG; ++i) {
+        // Same register -> KV-column mapping logits_mask_ uses.
+        const uint32_t kv_col = 2 * (lane_idx % 4) + 8 * (i / 4) + i % 2;
+        s_frag[i] *= qk_scale * smem_storage->kv_scale[kv_col] * inv_ckv_ref;
+      }
+    } else {
+#pragma unroll
+      for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG; ++i) {
+        s_frag[i] *= qk_scale;
+      }
     }
     return;
   } else {
