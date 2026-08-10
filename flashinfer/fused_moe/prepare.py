@@ -175,12 +175,39 @@ def _process_humming_mxfp4_w4a8_payload(
         )
 
     lut = _humming_mxfp4_w4a8_rewrite_lut_cpu().to(weight.device)
-    lo = weight & 0x0F
-    hi = (weight >> 4) & 0x0F
-    fp4_codes = torch.stack([lo, hi], dim=-1).reshape(*weight.shape[:-1], -1)
-    delta = delta_scale_offsets.repeat_interleave(32, dim=-1).to(torch.long)
-    rewritten = lut[delta, fp4_codes.to(torch.long)]
-    processed = rewritten[..., 0::2] | (rewritten[..., 1::2] << 4)
+    # --- MDL-77-SITU:humming-payload-memory: bounded payload rewrite ---
+    # One E8M0 delta applies to 32 FP4 values.  Do not expand the full
+    # [experts, rows, K] tensor: for K3 W13 at TP1 that int64 temporary is
+    # 147 GiB.  Flatten only the leading expert/row dimensions and rewrite
+    # bounded row chunks; every output byte is independent, so chunking is
+    # byte-exact and does not change Humming's LUT semantics.
+    processed = torch.empty_like(weight, memory_format=torch.contiguous_format)
+    flat_weight = weight.reshape(-1, weight.shape[-1])
+    flat_delta = delta_scale_offsets.reshape(-1, delta_scale_offsets.shape[-1])
+    flat_processed = processed.reshape(-1, processed.shape[-1])
+    fp4_width = int(weight.shape[-1]) * 2
+    # Two int64 index tensors plus the small uint8 payload intermediates.  This
+    # conservative 20 B/FP4-value bound keeps the working set below 256 MiB;
+    # the source/output tensors remain the unavoidable full-weight storage.
+    humming_payload_temp_bytes = 256 * 1024**2
+    rows_per_chunk = max(
+        1, humming_payload_temp_bytes // (fp4_width * 20)
+    )
+    for row_start in range(0, flat_weight.shape[0], rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, flat_weight.shape[0])
+        chunk_weight = flat_weight[row_start:row_end]
+        chunk_delta = flat_delta[row_start:row_end]
+        lo = chunk_weight & 0x0F
+        hi = (chunk_weight >> 4) & 0x0F
+        chunk_codes = torch.stack([lo, hi], dim=-1).reshape(
+            row_end - row_start, -1
+        )
+        chunk_delta = chunk_delta.repeat_interleave(32, dim=-1).to(torch.long)
+        rewritten = lut[chunk_delta, chunk_codes.to(torch.long)]
+        flat_processed[row_start:row_end] = (
+            rewritten[..., 0::2] | (rewritten[..., 1::2] << 4)
+        )
+        del chunk_weight, chunk_delta, lo, hi, chunk_codes, rewritten
     return processed.contiguous()
 
 

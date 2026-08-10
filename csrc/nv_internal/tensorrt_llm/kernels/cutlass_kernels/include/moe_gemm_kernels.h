@@ -244,7 +244,9 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
   return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu ||
          activation_type == ActivationType::SwigluBias ||
          activation_type == ActivationType::SwigluStep ||
-         activation_type == ActivationType::GegluTanh;
+         activation_type == ActivationType::GegluTanh ||
+         // MDL-77-SITU: SiTU is a gated FC1 activation.
+         activation_type == ActivationType::Situ;
 }
 
 enum class Sm90Wfp4Afp8ScaleMode : uint8_t {

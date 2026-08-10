@@ -2210,6 +2210,50 @@ struct SwigluStepAdaptor {
   }
 };
 
+// --- MDL-77-SITU: exact Kimi K3 SiTU adaptor ---
+// The Humming FC1 layout is [up; gate].  doActivation/doGatedActivation pass
+// the second half first, so the adaptor arguments are (gate, up).  The
+// nonlinear operations intentionally promote/operate in FP32 before the
+// caller's BF16/FP8 conversion.
+template <class T>
+__device__ T mdl77_situ_apply(T const& gate, T const& up, float alpha, float limit) {
+  float const gate_f = static_cast<float>(gate);
+  float const up_f = static_cast<float>(up);
+  float const gate_act = alpha * tanhf(gate_f / alpha) * (1.0f / (1.0f + expf(-gate_f)));
+  float const up_act = limit * tanhf(up_f / limit);
+  return static_cast<T>(gate_act * up_act);
+}
+
+template <int N>
+__device__ cutlass::Array<float, N> mdl77_situ_apply(
+    cutlass::Array<float, N> const& gate, cutlass::Array<float, N> const& up,
+    float alpha, float limit) {
+  cutlass::Array<float, N> result;
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    float const gate_f = gate[i];
+    float const up_f = up[i];
+    float const gate_act = alpha * tanhf(gate_f / alpha) * (1.0f / (1.0f + expf(-gate_f)));
+    float const up_act = limit * tanhf(up_f / limit);
+    result[i] = gate_act * up_act;
+  }
+  return result;
+}
+
+struct SituAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 4.0f;   // K3 gate beta
+  float beta = 0.0f;    // shared adaptor ABI; unused by SiTU
+  float limit = 25.0f;  // K3 linear beta
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& up) const {
+    return mdl77_situ_apply(gate, up, alpha, limit);
+  }
+};
+// --- end MDL-77-SITU adaptor ---
+
+
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2241,9 +2285,12 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
   int64_t const inter_size_vec = inter_size / ACTIVATION_ELEM_PER_THREAD;
 
-  float gate_alpha = 1.0f;
+  // MDL-77-SITU: default alpha/limit are K3's 4.0/25.0 for Situ.
+  float gate_alpha = activation_type.activation_type == ActivationType::Situ ? 4.0f : 1.0f;
   float gate_bias = 0.0f;
-  float gate_limit = std::numeric_limits<float>::infinity();
+  float gate_limit = activation_type.activation_type == ActivationType::Situ
+                          ? 25.0f
+                          : std::numeric_limits<float>::infinity();
   if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit) {
     int expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
                                              (int64_t)token + 1) -
@@ -2293,6 +2340,9 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
              : activation_type == ActivationType::SwigluStep
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
+             // MDL-77-SITU: the non-TMA gated activation fallback uses the same adaptor.
+             : activation_type == ActivationType::Situ
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2356,9 +2406,12 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     size_t output_offset = token * inter_size;
 
     int64_t expert = 0;
-    float gate_alpha = 1.0f;
+    // MDL-77-SITU: default alpha/limit are K3's 4.0/25.0 for Situ.
+    float gate_alpha = activation_params.activation_type == ActivationType::Situ ? 4.0f : 1.0f;
     float gate_beta = 0.0f;
-    float gate_limit = std::numeric_limits<float>::infinity();
+    float gate_limit = activation_params.activation_type == ActivationType::Situ
+                            ? 25.0f
+                            : std::numeric_limits<float>::infinity();
     if (bias_ptr || IsNVFP4 || IsMXFP8 || use_per_expert_act_scale ||
         activation_params.swiglu_alpha || activation_params.swiglu_beta ||
         activation_params.swiglu_limit) {
@@ -2573,7 +2626,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Identity
+                              decltype(nvfp4_4over6_config_tag)>,  // Identity
+          // MDL-77-SITU:activation-dispatch fn_list index 10 synchronized with ActivationType::Situ.
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
+                              decltype(block_scaling_type)::value,
+                              decltype(disableFP4QuantFastMathTag)::value,
+                              decltype(nvfp4_4over6_config_tag)>  // Situ
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };

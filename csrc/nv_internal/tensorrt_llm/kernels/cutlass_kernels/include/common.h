@@ -30,6 +30,8 @@ enum class ActivationType {
   SwigluStep,
   GegluTanh,
   Identity,
+  // MDL-77-SITU: value 10, synchronized with Python/TRTLLM enums.
+  Situ,
   InvalidType
 };
 

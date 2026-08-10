@@ -412,8 +412,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(swiglu_limit.value().size(0), num_experts_on_rank)
           << "swiglu_limit must have num_experts_on_rank elements.";
     }
-    // Swiglu + swiglu_alpha/beta/limit selects the SwigluBias kernel; other gated activations
-    // (e.g. SwigluStep) keep their own kernel.
+    // MDL-77-SITU:binding-guard only plain Swiglu promotes to SwigluBias.  Situ must
+    // retain its own adaptor while reusing the swiglu_* ABI tensors.
+    // (SwigluStep and Situ therefore keep their own kernels.)
     if (base_activation_type == ActivationType::Swiglu &&
         (swiglu_alpha.has_value() || swiglu_beta.has_value() || swiglu_limit.has_value())) {
       base_activation_type = ActivationType::SwigluBias;
@@ -583,8 +584,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(swiglu_limit.value().size(0), num_experts_on_rank)
           << "swiglu_limit must have num_experts_on_rank elements.";
     }
-    // Swiglu + swiglu_alpha/beta/limit selects the SwigluBias kernel; other gated activations
-    // (e.g. SwigluStep) keep their own kernel.
+    // MDL-77-SITU:binding-guard only plain Swiglu promotes to SwigluBias.  Situ must
+    // retain its own adaptor while reusing the swiglu_* ABI tensors.
+    // (SwigluStep and Situ therefore keep their own kernels.)
     if (base_activation_type == ActivationType::Swiglu &&
         (swiglu_alpha.has_value() || swiglu_beta.has_value() || swiglu_limit.has_value())) {
       base_activation_type = ActivationType::SwigluBias;
